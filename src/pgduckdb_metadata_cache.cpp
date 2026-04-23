@@ -95,6 +95,22 @@ struct {
 	 * instead (e.g. a hash table). For now using a list is fine though.
 	 */
 	List *duckdb_only_functions;
+	/* IvorySQL Oracle-compatible type OIDs (InvalidOid when IvorySQL not installed) */
+	Oid ivory_oradate_oid;
+	Oid ivory_oratimestamp_oid;
+	Oid ivory_oratimestamptz_oid;
+	Oid ivory_oratimestampltz_oid;
+	Oid ivory_yminterval_oid;
+	Oid ivory_dsinterval_oid;
+	Oid ivory_number_oid;
+	Oid ivory_binary_float_oid;
+	Oid ivory_binary_double_oid;
+	Oid ivory_oravarcharchar_oid;
+	Oid ivory_oravarcharbyte_oid;
+	Oid ivory_oracharchar_oid;
+	Oid ivory_oracharbyte_oid;
+	Oid ivory_raw_long_oid;
+	Oid ivory_xmltype_oid;
 } cache = {};
 
 bool callback_is_configured = false;
@@ -288,6 +304,62 @@ IsExtensionRegistered() {
 
 		cache.json_oid = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum("json"), cache.schema_oid);
 
+		{
+			// IvorySQL Oracle types live in the 'sys' namespace. The cache callback above is
+			// subscribed only to 'duckdb' namespace changes, so ivory OIDs are not automatically
+			// reloaded if IvorySQL is installed after pg_duckdb in the same backend session.
+			// A new session or a pg_duckdb reload will pick up the correct OIDs.
+			Oid ivory_ns = get_namespace_oid("sys", true /* missing_ok */);
+			if (OidIsValid(ivory_ns)) {
+				cache.ivory_oradate_oid =
+				    GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum("oradate"), ivory_ns);
+				cache.ivory_oratimestamp_oid =
+				    GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum("oratimestamp"), ivory_ns);
+				cache.ivory_oratimestamptz_oid =
+				    GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum("oratimestamptz"), ivory_ns);
+				cache.ivory_oratimestampltz_oid =
+				    GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum("oratimestampltz"), ivory_ns);
+				cache.ivory_yminterval_oid =
+				    GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum("yminterval"), ivory_ns);
+				cache.ivory_dsinterval_oid =
+				    GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum("dsinterval"), ivory_ns);
+				cache.ivory_number_oid =
+				    GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum("number"), ivory_ns);
+				cache.ivory_binary_float_oid =
+				    GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum("binary_float"), ivory_ns);
+				cache.ivory_binary_double_oid =
+				    GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum("binary_double"), ivory_ns);
+				cache.ivory_oravarcharchar_oid =
+				    GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum("oravarcharchar"), ivory_ns);
+				cache.ivory_oravarcharbyte_oid =
+				    GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum("oravarcharbyte"), ivory_ns);
+				cache.ivory_oracharchar_oid =
+				    GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum("oracharchar"), ivory_ns);
+				cache.ivory_oracharbyte_oid =
+				    GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum("oracharbyte"), ivory_ns);
+				cache.ivory_raw_long_oid =
+				    GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum("raw_long"), ivory_ns);
+				cache.ivory_xmltype_oid =
+				    GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid, CStringGetDatum("xmltype"), ivory_ns);
+			} else {
+				cache.ivory_oradate_oid        = InvalidOid;
+				cache.ivory_oratimestamp_oid   = InvalidOid;
+				cache.ivory_oratimestamptz_oid  = InvalidOid;
+				cache.ivory_oratimestampltz_oid = InvalidOid;
+				cache.ivory_yminterval_oid     = InvalidOid;
+				cache.ivory_dsinterval_oid     = InvalidOid;
+				cache.ivory_number_oid         = InvalidOid;
+				cache.ivory_binary_float_oid   = InvalidOid;
+				cache.ivory_binary_double_oid  = InvalidOid;
+				cache.ivory_oravarcharchar_oid = InvalidOid;
+				cache.ivory_oravarcharbyte_oid = InvalidOid;
+				cache.ivory_oracharchar_oid    = InvalidOid;
+				cache.ivory_oracharbyte_oid    = InvalidOid;
+				cache.ivory_raw_long_oid       = InvalidOid;
+				cache.ivory_xmltype_oid        = InvalidOid;
+			}
+		}
+
 		if (duckdb_postgres_role[0] != '\0') {
 			cache.postgres_role_oid =
 			    GetSysCacheOid1(AUTHNAME, Anum_pg_authid_oid, CStringGetDatum(duckdb_postgres_role));
@@ -408,6 +480,96 @@ Oid
 DuckdbTableAmOid() {
 	Assert(cache.valid);
 	return cache.table_am_oid;
+}
+
+Oid
+IvoryOradateOid() {
+	Assert(cache.valid);
+	return cache.ivory_oradate_oid;
+}
+
+Oid
+IvoryOratimestampOid() {
+	Assert(cache.valid);
+	return cache.ivory_oratimestamp_oid;
+}
+
+Oid
+IvoryOratimestamptzOid() {
+	Assert(cache.valid);
+	return cache.ivory_oratimestamptz_oid;
+}
+
+Oid
+IvoryOratimestampltzOid() {
+	Assert(cache.valid);
+	return cache.ivory_oratimestampltz_oid;
+}
+
+Oid
+IvoryYmintervalOid() {
+	Assert(cache.valid);
+	return cache.ivory_yminterval_oid;
+}
+
+Oid
+IvoryDsintervalOid() {
+	Assert(cache.valid);
+	return cache.ivory_dsinterval_oid;
+}
+
+Oid
+IvoryNumberOid() {
+	Assert(cache.valid);
+	return cache.ivory_number_oid;
+}
+
+Oid
+IvoryBinaryFloatOid() {
+	Assert(cache.valid);
+	return cache.ivory_binary_float_oid;
+}
+
+Oid
+IvoryBinaryDoubleOid() {
+	Assert(cache.valid);
+	return cache.ivory_binary_double_oid;
+}
+
+Oid
+IvoryOravarcharcharOid() {
+	Assert(cache.valid);
+	return cache.ivory_oravarcharchar_oid;
+}
+
+Oid
+IvoryOravarcharbyteOid() {
+	Assert(cache.valid);
+	return cache.ivory_oravarcharbyte_oid;
+}
+
+Oid
+IvoryOracharcharOid() {
+	Assert(cache.valid);
+	return cache.ivory_oracharchar_oid;
+}
+
+Oid
+IvoryOracharbyteOid() {
+	Assert(cache.valid);
+	return cache.ivory_oracharbyte_oid;
+}
+
+Oid
+IvoryRawLongOid() {
+	Assert(cache.valid);
+	return cache.ivory_raw_long_oid;
+}
+
+Oid
+IvoryXmltypeOid() {
+	Assert(cache.valid);
+	return cache.ivory_xmltype_oid;
 }
 
 bool

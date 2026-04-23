@@ -9,7 +9,6 @@
 #include "pgduckdb/pgduckdb_types.hpp"
 #include "pgduckdb/pgduckdb_metadata_cache.hpp"
 #include "pgduckdb/pgduckdb_utils.hpp"
-#include "pgduckdb/pgduckdb_metadata_cache.hpp"
 #include "pgduckdb/scan/postgres_scan.hpp"
 #include "pgduckdb/pg/memory.hpp"
 #include "pgduckdb/pg/types.hpp"
@@ -1267,6 +1266,47 @@ ConvertDuckToPostgresValue(TupleTableSlot *slot, duckdb::Value &value, idx_t col
 			ConvertDuckToPostgresArray<MapArray>(slot, value, col);
 			return true;
 		}
+		// IvorySQL Oracle types: dispatch to existing Datum converters by type family.
+		if (OidIsValid(pgduckdb::IvoryOradateOid())) {
+			if (oid == pgduckdb::IvoryOradateOid() || oid == pgduckdb::IvoryOratimestampOid()) {
+				slot->tts_values[col] = ConvertTimestampDatum(value);
+				return true;
+			}
+			if (oid == pgduckdb::IvoryOratimestamptzOid() || oid == pgduckdb::IvoryOratimestampltzOid()) {
+				slot->tts_values[col] = ConvertTimestampTzDatum(value);
+				return true;
+			}
+			if (oid == pgduckdb::IvoryYmintervalOid() || oid == pgduckdb::IvoryDsintervalOid()) {
+				// WARNING: IvorySQL interval Datum format must be verified before relying on this.
+				// See spec Section 5 for verification procedure.
+				slot->tts_values[col] = ConvertIntervalDatum(value);
+				return true;
+			}
+			if (oid == pgduckdb::IvoryNumberOid()) {
+				// If ivory:number mapped to DOUBLE, ConvertNumericDatum returns Float8GetDatum.
+				// WARNING: Verify sys.number accepts float8 Datum format for unbounded NUMBER columns.
+				slot->tts_values[col] = ConvertNumericDatum(value);
+				return true;
+			}
+			if (oid == pgduckdb::IvoryBinaryFloatOid()) {
+				slot->tts_values[col] = ConvertFloatDatum(value);
+				return true;
+			}
+			if (oid == pgduckdb::IvoryBinaryDoubleOid()) {
+				slot->tts_values[col] = ConvertDoubleDatum(value);
+				return true;
+			}
+			if (oid == pgduckdb::IvoryOravarcharcharOid() || oid == pgduckdb::IvoryOravarcharbyteOid() ||
+			    oid == pgduckdb::IvoryOracharcharOid() || oid == pgduckdb::IvoryOracharbyteOid() ||
+			    oid == pgduckdb::IvoryXmltypeOid()) {
+				slot->tts_values[col] = ConvertToStringDatum(value);
+				return true;
+			}
+			if (oid == pgduckdb::IvoryRawLongOid()) {
+				slot->tts_values[col] = ConvertBinaryDatum(value);
+				return true;
+			}
+		}
 		elog(WARNING, "(PGDuckDB/ConvertDuckToPostgresValue) Unsuported pgduckdb type: %d", oid);
 		return false;
 	}
@@ -1412,6 +1452,61 @@ ConvertPostgresToBaseDuckColumnType(Form_pg_attribute &attribute) {
 		} else if (typoid == pgduckdb::DuckdbMapArrayOid()) {
 			return duckdb::LogicalTypeId::MAP;
 		}
+		// IvorySQL Oracle-compatible types (runtime OID matching, silent no-op on standard PG).
+		// OradateOid is a sentinel: all 15 ivory OIDs are initialized atomically.
+		if (OidIsValid(pgduckdb::IvoryOradateOid())) {
+			auto make_ivory = [](duckdb::LogicalType t, const char *typname) -> duckdb::LogicalType {
+				t.SetAlias(std::string("ivory:") + typname);
+				return t;
+			};
+			// Oracle DATE includes time-of-day and is stored as Timestamp(us) — same as oratimestamp.
+			// Field-level Arrow metadata ("ivory_original_type"="DATE") is the only way to distinguish them
+			// in Path B (mooncake_schema.cpp). Here in Path A, the OID is unambiguous.
+			if (typoid == pgduckdb::IvoryOradateOid())
+				return make_ivory(duckdb::LogicalTypeId::TIMESTAMP, "oradate");
+			if (typoid == pgduckdb::IvoryOratimestampOid())
+				return make_ivory(duckdb::LogicalTypeId::TIMESTAMP, "oratimestamp");
+			if (typoid == pgduckdb::IvoryOratimestamptzOid())
+				return make_ivory(duckdb::LogicalTypeId::TIMESTAMP_TZ, "oratimestamptz");
+			if (typoid == pgduckdb::IvoryOratimestampltzOid())
+				return make_ivory(duckdb::LogicalTypeId::TIMESTAMP_TZ, "oratimestampltz");
+			if (typoid == pgduckdb::IvoryYmintervalOid())
+				return make_ivory(duckdb::LogicalTypeId::INTERVAL, "yminterval");
+			if (typoid == pgduckdb::IvoryDsintervalOid())
+				return make_ivory(duckdb::LogicalTypeId::INTERVAL, "dsinterval");
+			if (typoid == pgduckdb::IvoryNumberOid()) {
+				auto precision = numeric_typmod_precision(type_modifier);
+				auto scale = numeric_typmod_scale(type_modifier);
+				duckdb::LogicalType t;
+				if (type_modifier == -1 || precision < 1 || precision > 38 ||
+				    scale < 0 || scale > 38 || scale > precision) {
+					// Unbounded NUMBER: use DOUBLE with NumericAsDouble aux_info so the scan path
+					// reads the varlena NUMERIC datum correctly (same pattern as standard NUMERICOID).
+					auto extra_type_info = duckdb::make_shared_ptr<NumericAsDouble>();
+					t = duckdb::LogicalType(duckdb::LogicalTypeId::DOUBLE, std::move(extra_type_info));
+				} else {
+					t = duckdb::LogicalType::DECIMAL(precision, scale);
+				}
+				t.SetAlias("ivory:number");
+				return t;
+			}
+			if (typoid == pgduckdb::IvoryBinaryFloatOid())
+				return make_ivory(duckdb::LogicalTypeId::FLOAT, "binary_float");
+			if (typoid == pgduckdb::IvoryBinaryDoubleOid())
+				return make_ivory(duckdb::LogicalTypeId::DOUBLE, "binary_double");
+			if (typoid == pgduckdb::IvoryOravarcharcharOid())
+				return make_ivory(duckdb::LogicalTypeId::VARCHAR, "oravarcharchar");
+			if (typoid == pgduckdb::IvoryOravarcharbyteOid())
+				return make_ivory(duckdb::LogicalTypeId::VARCHAR, "oravarcharbyte");
+			if (typoid == pgduckdb::IvoryOracharcharOid())
+				return make_ivory(duckdb::LogicalTypeId::VARCHAR, "oracharchar");
+			if (typoid == pgduckdb::IvoryOracharbyteOid())
+				return make_ivory(duckdb::LogicalTypeId::VARCHAR, "oracharbyte");
+			if (typoid == pgduckdb::IvoryRawLongOid())
+				return make_ivory(duckdb::LogicalTypeId::BLOB, "raw_long");
+			if (typoid == pgduckdb::IvoryXmltypeOid())
+				return make_ivory(duckdb::LogicalTypeId::VARCHAR, "xmltype");
+		}
 		return CreateUnsupportedPostgresType("Oid=" + std::to_string(attribute->atttypid));
 	}
 }
@@ -1543,6 +1638,38 @@ CheckForUnsupportedPostgresType(duckdb::LogicalType type) {
 	}
 }
 
+// Returns "oradate" from alias "ivory:oradate", or "" for non-ivory types.
+static std::string
+GetIvoryTypeName(const duckdb::LogicalType &type) {
+	const auto &alias = type.GetAlias();
+	if (alias.rfind("ivory:", 0) == 0) {
+		return alias.substr(6);
+	}
+	return {};
+}
+
+// Maps pg_type.typname to the corresponding cached OID.
+// Must stay in sync with the Path A OID->LogicalType mapping above — both tables cover exactly the same 15 types.
+static Oid
+IvoryOidByTypname(const std::string &name) {
+	if (name == "oradate")         return pgduckdb::IvoryOradateOid();
+	if (name == "oratimestamp")    return pgduckdb::IvoryOratimestampOid();
+	if (name == "oratimestamptz")  return pgduckdb::IvoryOratimestamptzOid();
+	if (name == "oratimestampltz") return pgduckdb::IvoryOratimestampltzOid();
+	if (name == "yminterval")      return pgduckdb::IvoryYmintervalOid();
+	if (name == "dsinterval")      return pgduckdb::IvoryDsintervalOid();
+	if (name == "number")          return pgduckdb::IvoryNumberOid();
+	if (name == "binary_float")    return pgduckdb::IvoryBinaryFloatOid();
+	if (name == "binary_double")   return pgduckdb::IvoryBinaryDoubleOid();
+	if (name == "oravarcharchar")  return pgduckdb::IvoryOravarcharcharOid();
+	if (name == "oravarcharbyte")  return pgduckdb::IvoryOravarcharbyteOid();
+	if (name == "oracharchar")     return pgduckdb::IvoryOracharcharOid();
+	if (name == "oracharbyte")     return pgduckdb::IvoryOracharbyteOid();
+	if (name == "raw_long")        return pgduckdb::IvoryRawLongOid();
+	if (name == "xmltype")         return pgduckdb::IvoryXmltypeOid();
+	return InvalidOid;
+}
+
 Oid
 GetPostgresDuckDBType(const duckdb::LogicalType &type, bool throw_error) {
 	CheckForUnsupportedPostgresType(type);
@@ -1567,31 +1694,80 @@ GetPostgresDuckDBType(const duckdb::LogicalType &type, bool throw_error) {
 		return INT4OID;
 	case duckdb::LogicalTypeId::UINTEGER:
 		return INT8OID;
-	case duckdb::LogicalTypeId::VARCHAR:
+	case duckdb::LogicalTypeId::VARCHAR: {
+		auto ivory_name = GetIvoryTypeName(type);
+		if (!ivory_name.empty()) {
+			auto oid = IvoryOidByTypname(ivory_name);
+			if (OidIsValid(oid))
+				return oid;
+		}
 		return type.IsJSONType() ? JSONOID : TEXTOID;
+	}
 	case duckdb::LogicalTypeId::DATE:
 		return DATEOID;
 	case duckdb::LogicalTypeId::TIMESTAMP:
 	case duckdb::LogicalTypeId::TIMESTAMP_SEC:
 	case duckdb::LogicalTypeId::TIMESTAMP_MS:
-	case duckdb::LogicalTypeId::TIMESTAMP_NS:
+	case duckdb::LogicalTypeId::TIMESTAMP_NS: {
+		auto ivory_name = GetIvoryTypeName(type);
+		if (!ivory_name.empty()) {
+			auto oid = IvoryOidByTypname(ivory_name);
+			if (OidIsValid(oid))
+				return oid;
+		}
 		return TIMESTAMPOID;
-	case duckdb::LogicalTypeId::TIMESTAMP_TZ:
+	}
+	case duckdb::LogicalTypeId::TIMESTAMP_TZ: {
+		auto ivory_name = GetIvoryTypeName(type);
+		if (!ivory_name.empty()) {
+			auto oid = IvoryOidByTypname(ivory_name);
+			if (OidIsValid(oid))
+				return oid;
+		}
 		return TIMESTAMPTZOID;
-	case duckdb::LogicalTypeId::INTERVAL:
+	}
+	case duckdb::LogicalTypeId::INTERVAL: {
+		auto ivory_name = GetIvoryTypeName(type);
+		if (!ivory_name.empty()) {
+			auto oid = IvoryOidByTypname(ivory_name);
+			if (OidIsValid(oid))
+				return oid;
+		}
 		return INTERVALOID;
+	}
 	case duckdb::LogicalTypeId::BIT:
 		return VARBITOID;
 	case duckdb::LogicalTypeId::TIME:
 		return TIMEOID;
 	case duckdb::LogicalTypeId::TIME_TZ:
 		return TIMETZOID;
-	case duckdb::LogicalTypeId::FLOAT:
+	case duckdb::LogicalTypeId::FLOAT: {
+		auto ivory_name = GetIvoryTypeName(type);
+		if (!ivory_name.empty()) {
+			auto oid = IvoryOidByTypname(ivory_name);
+			if (OidIsValid(oid))
+				return oid;
+		}
 		return FLOAT4OID;
-	case duckdb::LogicalTypeId::DOUBLE:
+	}
+	case duckdb::LogicalTypeId::DOUBLE: {
+		auto ivory_name = GetIvoryTypeName(type);
+		if (!ivory_name.empty()) {
+			auto oid = IvoryOidByTypname(ivory_name);
+			if (OidIsValid(oid))
+				return oid;
+		}
 		return FLOAT8OID;
-	case duckdb::LogicalTypeId::DECIMAL:
+	}
+	case duckdb::LogicalTypeId::DECIMAL: {
+		auto ivory_name = GetIvoryTypeName(type);
+		if (!ivory_name.empty()) {
+			auto oid = IvoryOidByTypname(ivory_name);  // "number" -> IvoryNumberOid()
+			if (OidIsValid(oid))
+				return oid;
+		}
 		return NUMERICOID;
+	}
 	case duckdb::LogicalTypeId::UUID:
 		return UUIDOID;
 	case duckdb::LogicalTypeId::BIGNUM:
@@ -1607,8 +1783,15 @@ GetPostgresDuckDBType(const duckdb::LogicalType &type, bool throw_error) {
 		}
 		return GetPostgresArrayDuckDBType(*duck_type, throw_error);
 	}
-	case duckdb::LogicalTypeId::BLOB:
+	case duckdb::LogicalTypeId::BLOB: {
+		auto ivory_name = GetIvoryTypeName(type);
+		if (!ivory_name.empty()) {
+			auto oid = IvoryOidByTypname(ivory_name);
+			if (OidIsValid(oid))
+				return oid;
+		}
 		return BYTEAOID;
+	}
 	case duckdb::LogicalTypeId::UNION:
 		return pgduckdb::DuckdbUnionOid();
 	case duckdb::LogicalTypeId::MAP:
@@ -1875,7 +2058,12 @@ ConvertPostgresToDuckValue(Oid attr_type, Datum value, duckdb::Vector &result, i
 			AppendJsonb(result, value, offset);
 			break;
 		} else {
-			AppendString(result, value, offset, attr_type == BPCHAROID);
+			// oracharchar/oracharbyte are Oracle CHAR types: blank-padded to declared length,
+			// same as BPCHAROID — trim trailing spaces when reading into DuckDB.
+			auto ivory_name = GetIvoryTypeName(type);
+			bool is_bpchar = attr_type == BPCHAROID ||
+			                 ivory_name == "oracharchar" || ivory_name == "oracharbyte";
+			AppendString(result, value, offset, is_bpchar);
 		}
 		break;
 	}
