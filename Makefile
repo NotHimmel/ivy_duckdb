@@ -18,6 +18,22 @@ DUCKDB_GEN ?= ninja
 DUCKDB_VERSION = v1.4.3
 # duckdb build tweaks
 DUCKDB_CMAKE_VARS = -DCXX_EXTRA=-fvisibility=default -DBUILD_SHELL=0 -DBUILD_PYTHON=0 -DBUILD_UNITTESTS=0
+
+# Air-gapped build (`make OFFLINE=1 ivy_duckdb`, propagated from the top-level
+# Makefile). The only build-time network fetch on the DuckDB side is the httpfs
+# extension, which pg_duckdb_extensions.cmake pulls via CMake FetchContent
+# (register_external_extension -> GIT_REPOSITORY). Point FetchContent at the
+# source shipped in the offline bundle (../offline-deps/httpfs-src, produced by
+# `make offline-bundle`) instead of cloning, and set FULLY_DISCONNECTED so any
+# *other* remote fetch fails loudly at configure time rather than hanging on a
+# dead network. HTTPFS_SRC must be absolute: cmake runs from build/release.
+ifdef OFFLINE
+HTTPFS_SRC := $(abspath $(CURDIR)/../offline-deps/httpfs-src)
+DUCKDB_CMAKE_VARS += -DFETCHCONTENT_FULLY_DISCONNECTED=ON -DFETCHCONTENT_SOURCE_DIR_HTTPFS_EXTENSION_FC=$(HTTPFS_SRC)
+OFFLINE_GUARD := test -d "$(HTTPFS_SRC)" || { echo "OFFLINE=1 but $(HTTPFS_SRC) is missing. Run 'make offline-bundle' on a connected machine, or unpack the offline bundle, first." >&2; exit 1; }
+else
+OFFLINE_GUARD := true
+endif
 # set to 1 to disable asserts in DuckDB. This is particularly useful in combinition with MotherDuck.
 # When asserts are enabled the released motherduck extension will fail some of
 # those asserts. By disabling asserts it's possible to run a debug build of
@@ -131,6 +147,7 @@ duckdb: $(FULL_DUCKDB_LIB)
 	git submodule update --init --recursive
 
 $(FULL_DUCKDB_LIB): .git/modules/third_party/duckdb/HEAD third_party/pg_duckdb_extensions.cmake
+	@$(OFFLINE_GUARD)
 ifeq ($(DUCKDB_BUILD), ReleaseStatic)
 	mkdir -p third_party/duckdb/build/release/vcpkg_installed
 endif
