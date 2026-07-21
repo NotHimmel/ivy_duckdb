@@ -5,6 +5,8 @@
 #include "pgduckdb/pg/relations.hpp"
 #include "pgduckdb/pg/locale.hpp"
 
+#include <regex>
+
 extern "C" {
 #include "postgres.h"
 
@@ -604,6 +606,28 @@ pgduckdb_relation_name(Oid relation_oid) {
  * boundary check skips matches that are part of a longer identifier (e.g.
  * "pg_catalog.float8_array").
  *
+ * The second phase handles IvorySQL Oracle-mode types. format_type emits their
+ * Oracle display syntax -- "binary_double", "number(12,2)", "varchar2(120 char)",
+ * "timestamp(6) with local time zone", "raw(16)" etc. -- which DuckDB rejects
+ * with `Type with name binary_double does not exist`. Column scans avoid this
+ * because ConvertPostgresToDuckColumnType maps by OID (pgduckdb_types.cpp), but
+ * a CAST/coercion node in a query is deparsed by get_coercion_expr via a raw
+ * format_type_with_typemod() call, so the Oracle name leaks into the DuckDB SQL
+ * text. These names only ever reach DuckDB as a cast target "::<type>", so the
+ * rewrites below are anchored on "::" -- an identifier or column name never
+ * follows "::", so those are never touched. Decorations DuckDB can't parse
+ * ("120 char", the "(6)" precision, "with [local] time zone", "raw(16)"'s
+ * length) are stripped; NUMBER's precision/scale is preserved since DuckDB's
+ * DECIMAL accepts it. An optional "sys." qualifier is tolerated so the same
+ * pass also covers IvorySQL versions whose format_type schema-qualifies these.
+ *
+ * Known limitation (shared with the pg_catalog loop above): this is a textual
+ * rewrite, not a tokenizer, so a string/text *literal* that happens to contain
+ * the sequence "::<oracletype>" would also be rewritten. That is vanishingly
+ * rare in practice and is the same tradeoff the existing alias pass already
+ * accepts; tokenizing the deparsed SQL to skip quoted regions would be the
+ * robust fix if it ever matters.
+ *
  * The argument is consumed (pfree'd) and a freshly palloc'd replacement
  * is returned.
  */
@@ -639,6 +663,56 @@ pgduckdb_canonicalize_pg_type_aliases(char *input) {
 			s.replace(pos, from_str.size(), to_str);
 			pos += to_str.size();
 		}
+	}
+
+	/*
+	 * Oracle-mode cast targets. Ordered most-specific first so the greedy
+	 * timestamp variants win before the bare "timestamp" rule, and so
+	 * "number(p,s)" is handled before bare "number". Each pattern anchors on
+	 * "::" and an optional "sys." qualifier. std::regex is used because the
+	 * typmod decorations require pattern matching, not fixed substrings.
+	 */
+	static const std::pair<std::regex, const char *> kOracleCastRewrites[] = {
+		{std::regex("::(sys\\.)?timestamp(\\([0-9]+\\))? with local time zone"), "::timestamptz"},
+		{std::regex("::(sys\\.)?timestamp(\\([0-9]+\\))? with time zone"), "::timestamptz"},
+		{std::regex("::(sys\\.)?timestamp\\([0-9]+\\)"), "::timestamp"},
+		{std::regex("::(sys\\.)?number\\(([0-9]+),([0-9]+)\\)"), "::decimal($2,$3)"},
+		{std::regex("::(sys\\.)?number\\b(?!\\()"), "::double"},
+		{std::regex("::(sys\\.)?binary_double\\b"), "::double"},
+		{std::regex("::(sys\\.)?binary_float\\b"), "::real"},
+		/*
+		 * Character families. The national ("n") variants must precede their
+		 * base forms so the base rule can't swallow the tail (harmless here,
+		 * since "::" must sit right before the keyword, but kept explicit).
+		 * VARCHAR2 (and NVARCHAR2) emit "varchar2"/"varchar2(N[ char])"; the
+		 * CHAR variants emit "char(N[ char])" WITH a typmod but their bare
+		 * (typmod -1) form is the internal typname "oracharchar"/"oracharbyte",
+		 * so both spellings are covered.
+		 */
+		{std::regex("::(sys\\.)?nvarchar2(\\([^)]*\\))?"), "::varchar"},
+		{std::regex("::(sys\\.)?varchar2(\\([^)]*\\))?"), "::varchar"},
+		{std::regex("::(sys\\.)?nchar(\\([^)]*\\))?"), "::varchar"},
+		{std::regex("::(sys\\.)?char\\([^)]*\\)"), "::varchar"},
+		{std::regex("::(sys\\.)?oracharchar\\b"), "::varchar"},
+		{std::regex("::(sys\\.)?oracharbyte\\b"), "::varchar"},
+		/*
+		 * Not \b after the optional "(16)": there is no word boundary after
+		 * ")", so \b would let the length group match empty and leave "(16)"
+		 * stranded ("blob(16)", which DuckDB rejects). A negative lookahead
+		 * for a word char both anchors the bare "raw" form and lets the
+		 * length form consume its parens.
+		 */
+		{std::regex("::(sys\\.)?long_raw\\b"), "::blob"},
+		{std::regex("::(sys\\.)?raw(\\([0-9]+\\))?(?![A-Za-z0-9_])"), "::blob"},
+		/* LOB / LONG text families. "long_raw" (blob, above) must be matched
+		 * before bare "long"; \b keeps them independent regardless. */
+		{std::regex("::(sys\\.)?nclob\\b"), "::varchar"},
+		{std::regex("::(sys\\.)?clob\\b"), "::varchar"},
+		{std::regex("::(sys\\.)?long\\b"), "::varchar"},
+	};
+
+	for (const auto &r : kOracleCastRewrites) {
+		s = std::regex_replace(s, r.first, r.second);
 	}
 
 	char *result = static_cast<char *>(palloc(s.size() + 1));
