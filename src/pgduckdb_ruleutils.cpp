@@ -830,6 +830,20 @@ pgduckdb_get_tabledef(Oid relation_oid) {
 
 		const char *column_type_name = format_type_with_typemod(column->atttypid, column->atttypmod);
 
+		/*
+		 * On IvorySQL in Oracle mode format_type emits Oracle type names
+		 * (number, varchar2, date, raw, ...) that DuckDB's own CREATE TABLE
+		 * parser rejects. The query path fixes this in
+		 * pgduckdb_canonicalize_pg_type_aliases, but that rewrites cast targets
+		 * anchored on "::"; here the type stands alone as a column definition.
+		 * Reuse the exact same tested mapping by prefixing "::", canonicalizing,
+		 * and stripping it back -- a bare "::<type>" carries no identifier that
+		 * the "::"-anchored rules could clobber. Non-Oracle types pass through
+		 * unchanged.
+		 */
+		char *canon = pgduckdb_canonicalize_pg_type_aliases(psprintf("::%s", column_type_name));
+		column_type_name = canon + 2; /* skip the leading "::" */
+
 		if (first_column_printed) {
 			appendStringInfoString(&buffer, ", ");
 		}
