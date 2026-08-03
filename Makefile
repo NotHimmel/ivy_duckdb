@@ -1,4 +1,4 @@
-.PHONY: duckdb install-duckdb clean-duckdb clean-all lintcheck check-regression-duckdb clean-regression
+.PHONY: duckdb install-duckdb clean-duckdb clean-all lintcheck check-regression-duckdb check-regression-ivorysql clean-regression
 
 PG_DUCKDB_VERSION ?= $(shell git describe --always --dirty 2>/dev/null || echo "unknown")
 
@@ -125,6 +125,9 @@ PYTEST_CONCURRENCY = auto
 
 check-regression-duckdb:
 	$(MAKE) -C test/regression check-regression-duckdb
+
+check-regression-ivorysql:
+	$(MAKE) -C test/regression check-regression-ivorysql
 
 clean-regression:
 	$(MAKE) -C test/regression clean-regression
