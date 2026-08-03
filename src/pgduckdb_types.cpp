@@ -41,6 +41,16 @@ extern "C" {
 
 namespace pgduckdb {
 
+/*
+ * Compile time of THIS translation unit; reported by duckdb.build_info as
+ * types=. The Oracle type mapping lives here, so if this lags behind the rest
+ * of the build the mapping in the running binary is stale.
+ */
+const char *
+TypesBuildTimestamp() {
+	return __DATE__ " " __TIME__;
+}
+
 NumericVar FromNumeric(Numeric num);
 
 struct NumericAsDouble : public duckdb::ExtraTypeInfo {

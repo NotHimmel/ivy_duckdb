@@ -21,6 +21,45 @@ extern "C" {
 #define PG_DUCKDB_VERSION "unknown"
 #endif
 PG_MODULE_MAGIC_EXT(.name = "pg_duckdb", .version = PG_DUCKDB_VERSION);
+#endif
+
+} // extern "C"
+
+/*
+ * Build provenance, surfaced through the duckdb.build_info GUC.
+ *
+ * Why per-translation-unit timestamps: a stale object file linked into an
+ * otherwise fresh .so produces a binary whose behaviour silently disagrees
+ * with the source tree (we shipped exactly that: pgduckdb_types.o from one
+ * date, the rest from two other dates, relinked on a fourth). A single
+ * "version" string cannot catch it, so each TU that carries behaviour we care
+ * about reports its own compile time. types= drifting behind core= means the
+ * type mapping in this binary is NOT what the source says.
+ */
+#ifndef PG_DUCKDB_VERSION
+/*
+ * Fallback: the Makefile passes -DPG_DUCKDB_VERSION only as a target-specific
+ * flag on src/pgduckdb.o, which PGXS may expand too late to take effect.
+ * "unknown" here is not fatal — the core=/types= timestamps below are what
+ * actually catch a mixed build.
+ */
+#define PG_DUCKDB_VERSION "unknown"
+#endif
+
+namespace pgduckdb {
+const char *
+BuildRevision() {
+	return PG_DUCKDB_VERSION;
+}
+const char *
+CoreBuildTimestamp() {
+	return __DATE__ " " __TIME__;
+}
+} // namespace pgduckdb
+
+extern "C" {
+
+#ifdef PG_MODULE_MAGIC_EXT
 #else
 PG_MODULE_MAGIC;
 #endif

@@ -142,9 +142,28 @@ char *duckdb_max_temp_directory_size = strdup("");
 char *duckdb_default_collation = strdup("");
 char *duckdb_azure_transport_option_type = strdup("");
 char *duckdb_custom_user_agent = strdup("");
+char *duckdb_build_info = strdup("unknown");
+
+/* Defined in pgduckdb.cpp / pgduckdb_types.cpp — see the comment there. */
+const char *BuildRevision();
+const char *CoreBuildTimestamp();
+const char *TypesBuildTimestamp();
 
 void
 InitGUC() {
+	/*
+	 * Build provenance first, so it is available even if a later GUC fails.
+	 * Read-only: `SHOW duckdb.build_info;`. Verify it against the source commit
+	 * before trusting any acceptance run — a mixed build reports a core= and
+	 * types= that disagree.
+	 */
+	duckdb_build_info =
+	    psprintf("rev=%s core=%s types=%s", BuildRevision(), CoreBuildTimestamp(), TypesBuildTimestamp());
+	DefineCustomVariable("duckdb.build_info",
+	                     "Build provenance of the loaded pg_duckdb: git revision plus the compile "
+	                     "timestamp of each behaviour-carrying translation unit (read-only)",
+	                     &duckdb_build_info, PGC_INTERNAL, GUC_NOT_IN_SAMPLE | GUC_DISALLOW_IN_FILE);
+
 	/* pg_duckdb specific GUCs */
 	DefineCustomVariable("duckdb.force_execution", "Force queries to use DuckDB execution", &duckdb_force_execution,
 	                     PGC_USERSET, GUC_REPORT);
