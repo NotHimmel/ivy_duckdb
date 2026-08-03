@@ -9,6 +9,7 @@
 #include "duckdb/function/cast/default_casts.hpp"
 #include "duckdb/function/cast_rules.hpp"
 #include "duckdb/main/config.hpp"
+#include "duckdb/main/extension/extension_loader.hpp"
 
 #include "pgduckdb/pgduckdb_guc.hpp"
 #include "pgduckdb/pgduckdb_types.hpp"
@@ -59,6 +60,21 @@ TypesBuildTimestamp() {
 
 NumericVar FromNumeric(Numeric num);
 
+/*
+ * IvorySQL Oracle-type tagging.
+ *
+ * Oracle types are mapped onto DuckDB base types and tagged with an alias so
+ * the result can be converted back to the right Postgres type. The alias must
+ * be a plain SQL identifier: DuckDB round-trips column types through SQL text
+ * in places we do not control (e.g. the full-sort path builds
+ * "<name> <type>" strings and re-parses them with Parser::ParseColumnList), so
+ * a name like "ivory:oradate" makes those paths fail with a parser error. The
+ * names below are also registered as real types in DuckDB's system catalog
+ * (RegisterIvoryTypes) so that re-parsing resolves them back to the identical
+ * LogicalType.
+ */
+static constexpr const char *IVORY_ALIAS_PREFIX = "ivory_";
+
 struct NumericAsDouble : public duckdb::ExtraTypeInfo {
 	// Dummy struct to indicate at conversion that the source is a Numeric
 public:
@@ -70,6 +86,46 @@ public:
 		return duckdb::make_shared_ptr<NumericAsDouble>(*this);
 	}
 };
+
+/*
+ * Tag a base type as the given Oracle type. Constructs the type from its id
+ * instead of copying, because SetAlias() mutates the ExtraTypeInfo a copy would
+ * still share -- only valid for types whose identity is the id alone.
+ */
+duckdb::LogicalType
+IvoryAliasedType(duckdb::LogicalTypeId id, const char *typname) {
+	duckdb::LogicalType type(id);
+	type.SetAlias(std::string(IVORY_ALIAS_PREFIX) + typname);
+	return type;
+}
+
+/*
+ * Oracle NUMBER with a precision/scale: DECIMAL carrying the precision and
+ * scale as type modifiers, so that ToString() renders "ivory_number(p,s)" and
+ * the registered bind function can rebuild the identical type from that text.
+ */
+duckdb::LogicalType
+IvoryNumberDecimalType(uint8_t precision, uint8_t scale) {
+	auto type = duckdb::LogicalType::DECIMAL(precision, scale);
+	type.SetAlias(std::string(IVORY_ALIAS_PREFIX) + "number");
+	auto extension_info = duckdb::make_uniq<duckdb::ExtensionTypeInfo>();
+	extension_info->modifiers.emplace_back(duckdb::Value::INTEGER(precision));
+	extension_info->modifiers.emplace_back(duckdb::Value::INTEGER(scale));
+	type.SetExtensionInfo(std::move(extension_info));
+	return type;
+}
+
+/*
+ * Oracle NUMBER without a precision: DOUBLE plus the NumericAsDouble marker so
+ * the scan path reads the varlena NUMERIC datum correctly. No type modifiers,
+ * so it renders as a plain "ivory_number".
+ */
+duckdb::LogicalType
+IvoryNumberDoubleType() {
+	auto type = duckdb::LogicalType(duckdb::LogicalTypeId::DOUBLE, duckdb::make_shared_ptr<NumericAsDouble>());
+	type.SetAlias(std::string(IVORY_ALIAS_PREFIX) + "number");
+	return type;
+}
 
 // FIXME: perhaps we want to just make a generic ExtraTypeInfo that holds the Postgres type OID
 struct IsBpChar : public duckdb::ExtraTypeInfo {
@@ -1482,9 +1538,8 @@ ConvertPostgresToBaseDuckColumnType(Form_pg_attribute &attribute) {
 		// IvorySQL Oracle-compatible types (runtime OID matching, silent no-op on standard PG).
 		// OradateOid is a sentinel: all 15 ivory OIDs are initialized atomically.
 		if (OidIsValid(pgduckdb::IvoryOradateOid())) {
-			auto make_ivory = [](duckdb::LogicalType t, const char *typname) -> duckdb::LogicalType {
-				t.SetAlias(std::string("ivory:") + typname);
-				return t;
+			auto make_ivory = [](duckdb::LogicalTypeId id, const char *typname) -> duckdb::LogicalType {
+				return IvoryAliasedType(id, typname);
 			};
 			// Oracle DATE includes time-of-day and is stored as Timestamp(us) — same as oratimestamp.
 			// Field-level Arrow metadata ("ivory_original_type"="DATE") is the only way to distinguish them
@@ -1504,18 +1559,11 @@ ConvertPostgresToBaseDuckColumnType(Form_pg_attribute &attribute) {
 			if (typoid == pgduckdb::IvoryNumberOid()) {
 				auto precision = numeric_typmod_precision(type_modifier);
 				auto scale = numeric_typmod_scale(type_modifier);
-				duckdb::LogicalType t;
 				if (type_modifier == -1 || precision < 1 || precision > 38 ||
 				    scale < 0 || scale > 38 || scale > precision) {
-					// Unbounded NUMBER: use DOUBLE with NumericAsDouble aux_info so the scan path
-					// reads the varlena NUMERIC datum correctly (same pattern as standard NUMERICOID).
-					auto extra_type_info = duckdb::make_shared_ptr<NumericAsDouble>();
-					t = duckdb::LogicalType(duckdb::LogicalTypeId::DOUBLE, std::move(extra_type_info));
-				} else {
-					t = duckdb::LogicalType::DECIMAL(precision, scale);
+					return IvoryNumberDoubleType();
 				}
-				t.SetAlias("ivory:number");
-				return t;
+				return IvoryNumberDecimalType(static_cast<uint8_t>(precision), static_cast<uint8_t>(scale));
 			}
 			if (typoid == pgduckdb::IvoryBinaryFloatOid())
 				return make_ivory(duckdb::LogicalTypeId::FLOAT, "binary_float");
@@ -1671,7 +1719,7 @@ CheckForUnsupportedPostgresType(duckdb::LogicalType type) {
 static std::string
 GetIvoryTypeName(const duckdb::LogicalType &type) {
 	const auto &alias = type.GetAlias();
-	if (alias.rfind("ivory:", 0) == 0) {
+	if (alias.rfind("ivory_", 0) == 0) {
 		return alias.substr(6);
 	}
 	return {};
@@ -1701,7 +1749,7 @@ IvoryOidByTypname(const std::string &name) {
 }
 
 /*
- * Cast bind for aliased DECIMAL ("ivory:number") sources whose target is any
+ * Cast bind for aliased DECIMAL ("ivory_number") sources whose target is any
  * DECIMAL shape (registered under the bare-id wildcard key). Identity in
  * width/scale is a no-op; anything else delegates to the default
  * DECIMAL->DECIMAL rescale cast on the alias-free types.
@@ -1722,10 +1770,10 @@ IvoryDecimalCastBind(duckdb::BindCastInput &input, const duckdb::LogicalType &so
 	return duckdb::DefaultCasts::GetDefaultCastFunction(input, stripped_source, stripped_target);
 }
 
-// Returns `type` with an "ivory:" alias removed; other types are returned as is.
+// Returns `type` with an "ivory_" alias removed; other types are returned as is.
 static duckdb::LogicalType
 StripIvoryAlias(const duckdb::LogicalType &type) {
-	if (type.GetAlias().rfind("ivory:", 0) != 0) {
+	if (type.GetAlias().rfind("ivory_", 0) != 0) {
 		return type;
 	}
 	auto stripped = type;
@@ -1758,6 +1806,78 @@ IvoryAliasCastBind(duckdb::BindCastInput &input, const duckdb::LogicalType &sour
  * form. Registration is unconditional: the aliased types simply never occur
  * when IvorySQL is not installed.
  */
+/*
+ * Rebuild an ivory_number type from the modifiers found in its SQL text:
+ * "ivory_number(p,s)" -> the DECIMAL form, bare "ivory_number" -> the DOUBLE
+ * form. Needed because DuckDB resolves a type name back to a type through the
+ * catalog, and NUMBER is the only Oracle type here whose mapping depends on
+ * its typmod.
+ */
+static duckdb::LogicalType
+IvoryNumberBind(const duckdb::BindLogicalTypeInput &input) {
+	if (input.modifiers.size() != 2) {
+		return IvoryNumberDoubleType();
+	}
+	for (auto &modifier : input.modifiers) {
+		if (modifier.IsNull() || !modifier.type().IsIntegral()) {
+			return IvoryNumberDoubleType();
+		}
+	}
+	auto precision = input.modifiers[0].GetValue<int32_t>();
+	auto scale = input.modifiers[1].GetValue<int32_t>();
+	if (precision < 1 || precision > duckdb::Decimal::MAX_WIDTH_DECIMAL || scale < 0 || scale > precision) {
+		return IvoryNumberDoubleType();
+	}
+	return IvoryNumberDecimalType(static_cast<uint8_t>(precision), static_cast<uint8_t>(scale));
+}
+
+/*
+ * Make the Oracle type names resolvable in DuckDB.
+ *
+ * DuckDB renders a column type to SQL text and parses it back in paths outside
+ * our control -- the full-sort operator builds "<column> <type>" strings and
+ * calls Parser::ParseColumnList() on them, which is why an unregistered name
+ * failed with "Type with name ivory_oradate does not exist" (and, before the
+ * names became plain identifiers, with a parser error on the ':'). Registering
+ * the names in the system catalog closes that round trip: text -> catalog
+ * lookup -> the identical LogicalType, alias and all.
+ */
+void
+RegisterIvoryTypes(duckdb::DatabaseInstance &db) {
+	duckdb::ExtensionLoader loader(db, "pgduckdb");
+
+	static const struct {
+		const char *typname;
+		duckdb::LogicalTypeId id;
+	} kSimpleTypes[] = {
+	    {"oradate", duckdb::LogicalTypeId::TIMESTAMP},
+	    {"oratimestamp", duckdb::LogicalTypeId::TIMESTAMP},
+	    {"oratimestamptz", duckdb::LogicalTypeId::TIMESTAMP_TZ},
+	    {"oratimestampltz", duckdb::LogicalTypeId::TIMESTAMP_TZ},
+	    {"yminterval", duckdb::LogicalTypeId::INTERVAL},
+	    {"dsinterval", duckdb::LogicalTypeId::INTERVAL},
+	    {"binary_float", duckdb::LogicalTypeId::FLOAT},
+	    {"binary_double", duckdb::LogicalTypeId::DOUBLE},
+	    {"oravarcharchar", duckdb::LogicalTypeId::VARCHAR},
+	    {"oravarcharbyte", duckdb::LogicalTypeId::VARCHAR},
+	    {"oracharchar", duckdb::LogicalTypeId::VARCHAR},
+	    {"oracharbyte", duckdb::LogicalTypeId::VARCHAR},
+	    {"xmltype", duckdb::LogicalTypeId::VARCHAR},
+	    {"raw", duckdb::LogicalTypeId::BLOB},
+	    {"long_raw", duckdb::LogicalTypeId::BLOB},
+	};
+
+	for (const auto &entry : kSimpleTypes) {
+		auto name = std::string(IVORY_ALIAS_PREFIX) + entry.typname;
+		loader.RegisterType(name, IvoryAliasedType(entry.id, entry.typname));
+	}
+
+	// NUMBER carries its precision/scale as type modifiers; the bind function
+	// turns those back into the matching DECIMAL (or the DOUBLE form when the
+	// column has no typmod).
+	loader.RegisterType(std::string(IVORY_ALIAS_PREFIX) + "number", IvoryNumberDoubleType(), IvoryNumberBind);
+}
+
 void
 RegisterIvoryAliasCasts(duckdb::DBConfig &config) {
 	auto &casts = config.GetCastFunctions();
@@ -1813,36 +1933,29 @@ RegisterIvoryAliasCasts(duckdb::DBConfig &config) {
 	 * rather than copied from `base`, because SetAlias() mutates the shared
 	 * ExtraTypeInfo a copy would still point at -- see the DECIMAL loop below.
 	 */
-	auto register_simple = [&](const duckdb::LogicalType &base, const char *typname) {
-		duckdb::LogicalType aliased(base.id());
-		aliased.SetAlias(std::string("ivory:") + typname);
-		register_pair(aliased, base);
+	auto register_simple = [&](duckdb::LogicalTypeId id, const char *typname) {
+		register_pair(IvoryAliasedType(id, typname), duckdb::LogicalType(id));
 	};
 
 	// Must cover exactly the aliased forms produced by ConvertPostgresToDuckColumnType.
-	register_simple(duckdb::LogicalType::TIMESTAMP, "oradate");
-	register_simple(duckdb::LogicalType::TIMESTAMP, "oratimestamp");
-	register_simple(duckdb::LogicalType::TIMESTAMP_TZ, "oratimestamptz");
-	register_simple(duckdb::LogicalType::TIMESTAMP_TZ, "oratimestampltz");
-	register_simple(duckdb::LogicalType::INTERVAL, "yminterval");
-	register_simple(duckdb::LogicalType::INTERVAL, "dsinterval");
-	register_simple(duckdb::LogicalType::FLOAT, "binary_float");
-	register_simple(duckdb::LogicalType::DOUBLE, "binary_double");
-	register_simple(duckdb::LogicalType::VARCHAR, "oravarcharchar");
-	register_simple(duckdb::LogicalType::VARCHAR, "oravarcharbyte");
-	register_simple(duckdb::LogicalType::VARCHAR, "oracharchar");
-	register_simple(duckdb::LogicalType::VARCHAR, "oracharbyte");
-	register_simple(duckdb::LogicalType::VARCHAR, "xmltype");
-	register_simple(duckdb::LogicalType::BLOB, "raw");
-	register_simple(duckdb::LogicalType::BLOB, "long_raw");
+	register_simple(duckdb::LogicalTypeId::TIMESTAMP, "oradate");
+	register_simple(duckdb::LogicalTypeId::TIMESTAMP, "oratimestamp");
+	register_simple(duckdb::LogicalTypeId::TIMESTAMP_TZ, "oratimestamptz");
+	register_simple(duckdb::LogicalTypeId::TIMESTAMP_TZ, "oratimestampltz");
+	register_simple(duckdb::LogicalTypeId::INTERVAL, "yminterval");
+	register_simple(duckdb::LogicalTypeId::INTERVAL, "dsinterval");
+	register_simple(duckdb::LogicalTypeId::FLOAT, "binary_float");
+	register_simple(duckdb::LogicalTypeId::DOUBLE, "binary_double");
+	register_simple(duckdb::LogicalTypeId::VARCHAR, "oravarcharchar");
+	register_simple(duckdb::LogicalTypeId::VARCHAR, "oravarcharbyte");
+	register_simple(duckdb::LogicalTypeId::VARCHAR, "oracharchar");
+	register_simple(duckdb::LogicalTypeId::VARCHAR, "oracharbyte");
+	register_simple(duckdb::LogicalTypeId::VARCHAR, "xmltype");
+	register_simple(duckdb::LogicalTypeId::BLOB, "raw");
+	register_simple(duckdb::LogicalTypeId::BLOB, "long_raw");
 
 	// Unbounded NUMBER: DOUBLE with the NumericAsDouble marker aux-info.
-	{
-		auto extra_type_info = duckdb::make_shared_ptr<NumericAsDouble>();
-		auto unbounded = duckdb::LogicalType(duckdb::LogicalTypeId::DOUBLE, std::move(extra_type_info));
-		unbounded.SetAlias("ivory:number");
-		register_pair(unbounded, duckdb::LogicalType::DOUBLE);
-	}
+	register_pair(IvoryNumberDoubleType(), duckdb::LogicalType::DOUBLE);
 
 	// Bounded NUMBER: DECIMAL(p,s) with alias, one aliased form per valid (p,s).
 	// DECIMAL->DECIMAL rescaling between different (p,s) already has a default
@@ -1856,8 +1969,7 @@ RegisterIvoryAliasCasts(duckdb::DBConfig &config) {
 			// also alias `base` -- leaving no un-aliased type to derive the
 			// implicit cast costs from (they would all come out as -1, since
 			// DuckDB refuses implicit casts between differing aliases).
-			auto aliased = duckdb::LogicalType::DECIMAL(precision, scale);
-			aliased.SetAlias("ivory:number");
+			auto aliased = IvoryNumberDecimalType(precision, scale);
 			register_pair(aliased, base);
 			// Wildcard bare-DECIMAL target key: covers casts to any other DECIMAL
 			// shape and, more importantly, the implicit-cast cost lookup that

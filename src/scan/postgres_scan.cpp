@@ -50,7 +50,7 @@ std::optional<duckdb::string> ExpressionToString(const duckdb::Expression &expr,
 duckdb::Value
 AliasFreeValue(const duckdb::Value &value) {
 	const auto &alias = value.type().GetAlias();
-	if (alias.rfind("ivory:", 0) != 0) {
+	if (alias.rfind("ivory_", 0) != 0) {
 		return value;
 	}
 	auto base_type = value.type();

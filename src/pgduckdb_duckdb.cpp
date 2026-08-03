@@ -188,6 +188,7 @@ DuckDBManager::Initialize() {
 	auto &dbconfig = duckdb::DBConfig::GetConfig(*database->instance);
 	dbconfig.storage_extensions["pgduckdb"] = duckdb::make_uniq<PostgresStorageExtension>();
 	RegisterIvoryAliasCasts(dbconfig);
+	RegisterIvoryTypes(*database->instance);
 
 	// Register the unsupported type optimizer to run after all other optimizations
 	dbconfig.optimizer_extensions.push_back(UnsupportedTypeOptimizer::GetOptimizerExtension());

@@ -7,6 +7,7 @@
 
 namespace duckdb {
 struct DBConfig;
+class DatabaseInstance;
 }
 
 namespace pgduckdb {
@@ -37,6 +38,7 @@ constexpr int64_t PGDUCKDB_MIN_TIMESTAMP_VALUE = -210866803200000000;
 void CheckForUnsupportedPostgresType(duckdb::LogicalType type);
 
 void RegisterIvoryAliasCasts(duckdb::DBConfig &config);
+void RegisterIvoryTypes(duckdb::DatabaseInstance &db);
 duckdb::LogicalType ConvertPostgresToDuckColumnType(Form_pg_attribute &attribute);
 Oid GetPostgresDuckDBType(const duckdb::LogicalType &type, bool throw_error = false);
 int32_t GetPostgresDuckDBTypemod(const duckdb::LogicalType &type);
