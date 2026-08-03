@@ -17,20 +17,23 @@ check-regression-duckdb:
 	--load-extension=pg_duckdb \
 	$(if $(TEST),$(TEST),--schedule=schedule)
 
-# IvorySQL 专用：Oracle 类型 x pg_duckdb 执行路径。
+# IvorySQL-specific: Oracle types x pg_duckdb execution paths.
 #
-# 不用 --temp-instance：pg_regress 自己跑的 initdb 出来是 native PG 模式的簇，
-# SET ivorysql.compatible_mode = oracle 会被直接拒绝，整套用例全废。
-# 因此对一个**已经跑起来的** IvorySQL 实例做 installcheck。
+# --temp-instance is not usable: the cluster pg_regress initdb's itself is in
+# native PG mode, SET ivorysql.compatible_mode = oracle is rejected outright,
+# and the whole suite is useless. So this is an installcheck against an
+# ALREADY-RUNNING IvorySQL instance.
 #
-# 前置条件（不满足会在用例第 0 节立刻报错，不会静默跑出假绿）：
-#   1. 实例以 Oracle 模式 initdb（IvorySQL initdb 默认就是 oracle）
+# Prerequisites (violations fail loudly in section 0 of the test, no false
+# green):
+#   1. instance initdb'ed in Oracle mode (IvorySQL initdb default)
 #   2. shared_preload_libraries = 'liboracle_parser,ivorysql_ora,pg_duckdb'
-#   3. PGHOST / PGPORT / PGUSER 指向该实例，当前角色能建库建扩展
-# 其余 GUC（force_execution、unsafe_allow_execution_inside_functions）
-# 由用例自己 SET，不需要改服务端配置。
+#   3. PGHOST / PGPORT / PGUSER point at that instance; the role can create
+#      databases and extensions
+# Remaining GUCs (force_execution, unsafe_allow_execution_inside_functions)
+# are SET by the test itself; no server config changes needed.
 #
-# 用法：
+# Usage:
 #   PGPORT=1521 PGDATABASE=ivorysql make -C test/regression check-regression-ivorysql
 check-regression-ivorysql:
 	TEST_DIR=$(CURDIR) $(pg_regress_installcheck) \

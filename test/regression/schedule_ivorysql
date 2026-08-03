@@ -1,0 +1,5 @@
+# IvorySQL-specific regression schedule. Needs a real IvorySQL instance
+# (sys schema); cannot run on stock PostgreSQL, hence not part of the
+# default schedule.
+#   make -C test/regression check-regression-ivorysql
+test: ivorysql_oracle_types
