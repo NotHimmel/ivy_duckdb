@@ -7,6 +7,7 @@
 #include "duckdb/common/types/uuid.hpp"
 #include "duckdb/function/cast/cast_function_set.hpp"
 #include "duckdb/function/cast/default_casts.hpp"
+#include "duckdb/function/cast_rules.hpp"
 #include "duckdb/main/config.hpp"
 
 #include "pgduckdb/pgduckdb_guc.hpp"
@@ -1721,6 +1722,32 @@ IvoryDecimalCastBind(duckdb::BindCastInput &input, const duckdb::LogicalType &so
 	return duckdb::DefaultCasts::GetDefaultCastFunction(input, stripped_source, stripped_target);
 }
 
+// Returns `type` with an "ivory:" alias removed; other types are returned as is.
+static duckdb::LogicalType
+StripIvoryAlias(const duckdb::LogicalType &type) {
+	if (type.GetAlias().rfind("ivory:", 0) != 0) {
+		return type;
+	}
+	auto stripped = type;
+	stripped.SetAlias("");
+	return stripped;
+}
+
+/*
+ * Generic cast bind for an aliased source: drop the alias from both ends and
+ * delegate to the default cast between the underlying types.
+ */
+static duckdb::BoundCastInfo
+IvoryAliasCastBind(duckdb::BindCastInput &input, const duckdb::LogicalType &source,
+                   const duckdb::LogicalType &target) {
+	auto stripped_source = StripIvoryAlias(source);
+	auto stripped_target = StripIvoryAlias(target);
+	if (stripped_source == stripped_target) {
+		return duckdb::DefaultCasts::NopCast;
+	}
+	return duckdb::DefaultCasts::GetDefaultCastFunction(input, stripped_source, stripped_target);
+}
+
 /*
  * The "ivory:<typname>" alias makes an otherwise-identical DuckDB type compare
  * unequal to its alias-free base, so the binder inserts casts between them
@@ -1735,13 +1762,59 @@ void
 RegisterIvoryAliasCasts(duckdb::DBConfig &config) {
 	auto &casts = config.GetCastFunctions();
 
+	/*
+	 * An alias also hides the base type from DuckDB's implicit-cast rules
+	 * (CastRules::ImplicitCast compares full types), so without these entries
+	 * an aliased operand cannot reach ANY overload other than the exact
+	 * aliased one: e.g. number_col * 1.1 fails to bind with
+	 * "No function matches '*(ivory:number, DOUBLE)'" because the DECIMAL ->
+	 * DOUBLE widening the plain type would get is invisible. Register the
+	 * conversions the base type can reach, reusing the base type's own cost so
+	 * overload resolution keeps ranking candidates the way it would without
+	 * the alias. A negative cost still registers an explicit-only cast.
+	 */
+	auto register_reachable_targets = [&](const duckdb::LogicalType &aliased,
+	                                      const duckdb::LogicalType &base) {
+		static const duckdb::LogicalType kTargets[] = {
+		    duckdb::LogicalType::SMALLINT,
+		    duckdb::LogicalType::INTEGER,
+		    duckdb::LogicalType::BIGINT,
+		    duckdb::LogicalType::HUGEINT,
+		    duckdb::LogicalType::FLOAT,
+		    duckdb::LogicalType::DOUBLE,
+		    duckdb::LogicalType(duckdb::LogicalTypeId::DECIMAL),
+		    duckdb::LogicalType::VARCHAR,
+		    duckdb::LogicalType::DATE,
+		    duckdb::LogicalType::TIME,
+		    duckdb::LogicalType::TIMESTAMP,
+		    duckdb::LogicalType::TIMESTAMP_TZ,
+		    duckdb::LogicalType::INTERVAL,
+		    duckdb::LogicalType::BLOB,
+		};
+		for (const auto &target : kTargets) {
+			if (target.id() == base.id()) {
+				/* Handled by the identity registration in register_pair. */
+				continue;
+			}
+			auto cost = duckdb::CastRules::ImplicitCast(base, target);
+			casts.RegisterCastFunction(aliased, target, IvoryAliasCastBind, cost);
+		}
+	};
+
 	auto register_pair = [&](const duckdb::LogicalType &aliased, const duckdb::LogicalType &base) {
 		casts.RegisterCastFunction(aliased, base, duckdb::DefaultCasts::NopCast, 0);
 		casts.RegisterCastFunction(base, aliased, duckdb::DefaultCasts::NopCast, 0);
+		register_reachable_targets(aliased, base);
 	};
 
-	auto register_simple = [&](duckdb::LogicalType base, const char *typname) {
-		auto aliased = base;
+	/*
+	 * For types whose identity is fully described by their LogicalTypeId (no
+	 * width/scale or aux info). The aliased form is constructed from the id
+	 * rather than copied from `base`, because SetAlias() mutates the shared
+	 * ExtraTypeInfo a copy would still point at -- see the DECIMAL loop below.
+	 */
+	auto register_simple = [&](const duckdb::LogicalType &base, const char *typname) {
+		duckdb::LogicalType aliased(base.id());
 		aliased.SetAlias(std::string("ivory:") + typname);
 		register_pair(aliased, base);
 	};
@@ -1777,7 +1850,13 @@ RegisterIvoryAliasCasts(duckdb::DBConfig &config) {
 	for (uint8_t precision = 1; precision <= duckdb::Decimal::MAX_WIDTH_DECIMAL; precision++) {
 		for (uint8_t scale = 0; scale <= precision; scale++) {
 			auto base = duckdb::LogicalType::DECIMAL(precision, scale);
-			auto aliased = base;
+			// Construct the aliased form separately instead of copying `base`:
+			// LogicalType::SetAlias() mutates the ExtraTypeInfo in place, and a
+			// copied LogicalType shares that object, so aliasing a copy would
+			// also alias `base` -- leaving no un-aliased type to derive the
+			// implicit cast costs from (they would all come out as -1, since
+			// DuckDB refuses implicit casts between differing aliases).
+			auto aliased = duckdb::LogicalType::DECIMAL(precision, scale);
 			aliased.SetAlias("ivory:number");
 			register_pair(aliased, base);
 			// Wildcard bare-DECIMAL target key: covers casts to any other DECIMAL
