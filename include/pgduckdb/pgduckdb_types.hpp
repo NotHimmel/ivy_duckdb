@@ -5,6 +5,10 @@
 
 #include "pgduckdb/utility/cpp_only_file.hpp" // Must be last include.
 
+namespace duckdb {
+struct DBConfig;
+}
+
 namespace pgduckdb {
 
 struct PostgresScanGlobalState;
@@ -31,6 +35,8 @@ constexpr int64_t PGDUCKDB_MAX_TIMESTAMP_VALUE = 9223371244800000000;
 constexpr int64_t PGDUCKDB_MIN_TIMESTAMP_VALUE = -210866803200000000;
 
 void CheckForUnsupportedPostgresType(duckdb::LogicalType type);
+
+void RegisterIvoryAliasCasts(duckdb::DBConfig &config);
 duckdb::LogicalType ConvertPostgresToDuckColumnType(Form_pg_attribute &attribute);
 Oid GetPostgresDuckDBType(const duckdb::LogicalType &type, bool throw_error = false);
 int32_t GetPostgresDuckDBTypemod(const duckdb::LogicalType &type);

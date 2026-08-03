@@ -3,7 +3,11 @@
 #include "duckdb/common/extra_type_info.hpp"
 #include "duckdb/common/types/bit.hpp"
 #include "duckdb/common/types/blob.hpp"
+#include "duckdb/common/types/decimal.hpp"
 #include "duckdb/common/types/uuid.hpp"
+#include "duckdb/function/cast/cast_function_set.hpp"
+#include "duckdb/function/cast/default_casts.hpp"
+#include "duckdb/main/config.hpp"
 
 #include "pgduckdb/pgduckdb_guc.hpp"
 #include "pgduckdb/pgduckdb_types.hpp"
@@ -1681,6 +1685,97 @@ IvoryOidByTypname(const std::string &name) {
 	if (name == "long_raw")        return pgduckdb::IvoryLongRawOid();
 	if (name == "xmltype")         return pgduckdb::IvoryXmltypeOid();
 	return InvalidOid;
+}
+
+/*
+ * Cast bind for aliased DECIMAL ("ivory:number") sources whose target is any
+ * DECIMAL shape (registered under the bare-id wildcard key). Identity in
+ * width/scale is a no-op; anything else delegates to the default
+ * DECIMAL->DECIMAL rescale cast on the alias-free types.
+ */
+static duckdb::BoundCastInfo
+IvoryDecimalCastBind(duckdb::BindCastInput &input, const duckdb::LogicalType &source,
+                     const duckdb::LogicalType &target) {
+	auto stripped_source =
+	    duckdb::LogicalType::DECIMAL(duckdb::DecimalType::GetWidth(source), duckdb::DecimalType::GetScale(source));
+	auto stripped_target = target;
+	if (target.id() == duckdb::LogicalTypeId::DECIMAL && !target.GetAlias().empty()) {
+		stripped_target =
+		    duckdb::LogicalType::DECIMAL(duckdb::DecimalType::GetWidth(target), duckdb::DecimalType::GetScale(target));
+	}
+	if (stripped_source == stripped_target) {
+		return duckdb::DefaultCasts::NopCast;
+	}
+	return duckdb::DefaultCasts::GetDefaultCastFunction(input, stripped_source, stripped_target);
+}
+
+/*
+ * The "ivory:<typname>" alias makes an otherwise-identical DuckDB type compare
+ * unequal to its alias-free base, so the binder inserts casts between them
+ * (constant vs. column comparisons, function argument coercion). DuckDB has no
+ * default cast for a same-id pair (e.g. TIMESTAMP -> TIMESTAMP with alias) and
+ * fails with "Unimplemented type for cast". The physical representation is
+ * identical in both directions, so register free no-op casts for every aliased
+ * form. Registration is unconditional: the aliased types simply never occur
+ * when IvorySQL is not installed.
+ */
+void
+RegisterIvoryAliasCasts(duckdb::DBConfig &config) {
+	auto &casts = config.GetCastFunctions();
+
+	auto register_pair = [&](const duckdb::LogicalType &aliased, const duckdb::LogicalType &base) {
+		casts.RegisterCastFunction(aliased, base, duckdb::DefaultCasts::NopCast, 0);
+		casts.RegisterCastFunction(base, aliased, duckdb::DefaultCasts::NopCast, 0);
+	};
+
+	auto register_simple = [&](duckdb::LogicalType base, const char *typname) {
+		auto aliased = base;
+		aliased.SetAlias(std::string("ivory:") + typname);
+		register_pair(aliased, base);
+	};
+
+	// Must cover exactly the aliased forms produced by ConvertPostgresToDuckColumnType.
+	register_simple(duckdb::LogicalType::TIMESTAMP, "oradate");
+	register_simple(duckdb::LogicalType::TIMESTAMP, "oratimestamp");
+	register_simple(duckdb::LogicalType::TIMESTAMP_TZ, "oratimestamptz");
+	register_simple(duckdb::LogicalType::TIMESTAMP_TZ, "oratimestampltz");
+	register_simple(duckdb::LogicalType::INTERVAL, "yminterval");
+	register_simple(duckdb::LogicalType::INTERVAL, "dsinterval");
+	register_simple(duckdb::LogicalType::FLOAT, "binary_float");
+	register_simple(duckdb::LogicalType::DOUBLE, "binary_double");
+	register_simple(duckdb::LogicalType::VARCHAR, "oravarcharchar");
+	register_simple(duckdb::LogicalType::VARCHAR, "oravarcharbyte");
+	register_simple(duckdb::LogicalType::VARCHAR, "oracharchar");
+	register_simple(duckdb::LogicalType::VARCHAR, "oracharbyte");
+	register_simple(duckdb::LogicalType::VARCHAR, "xmltype");
+	register_simple(duckdb::LogicalType::BLOB, "raw");
+	register_simple(duckdb::LogicalType::BLOB, "long_raw");
+
+	// Unbounded NUMBER: DOUBLE with the NumericAsDouble marker aux-info.
+	{
+		auto extra_type_info = duckdb::make_shared_ptr<NumericAsDouble>();
+		auto unbounded = duckdb::LogicalType(duckdb::LogicalTypeId::DOUBLE, std::move(extra_type_info));
+		unbounded.SetAlias("ivory:number");
+		register_pair(unbounded, duckdb::LogicalType::DOUBLE);
+	}
+
+	// Bounded NUMBER: DECIMAL(p,s) with alias, one aliased form per valid (p,s).
+	// DECIMAL->DECIMAL rescaling between different (p,s) already has a default
+	// cast that ignores the alias; only the same-(p,s) identity pairs are missing.
+	for (uint8_t precision = 1; precision <= duckdb::Decimal::MAX_WIDTH_DECIMAL; precision++) {
+		for (uint8_t scale = 0; scale <= precision; scale++) {
+			auto base = duckdb::LogicalType::DECIMAL(precision, scale);
+			auto aliased = base;
+			aliased.SetAlias("ivory:number");
+			register_pair(aliased, base);
+			// Wildcard bare-DECIMAL target key: covers casts to any other DECIMAL
+			// shape and, more importantly, the implicit-cast cost lookup that
+			// function overload resolution does against the generic DECIMAL
+			// parameter of aggregates like sum()/avg().
+			casts.RegisterCastFunction(aliased, duckdb::LogicalType(duckdb::LogicalTypeId::DECIMAL),
+			                           IvoryDecimalCastBind, 0);
+		}
+	}
 }
 
 Oid

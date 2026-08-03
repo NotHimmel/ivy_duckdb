@@ -1,4 +1,6 @@
 #include <duckdb/common/types.hpp>
+#include <duckdb/planner/filter/constant_filter.hpp>
+#include <duckdb/planner/filter/in_filter.hpp>
 #include <duckdb/planner/filter/optional_filter.hpp>
 #include <duckdb/planner/filter/expression_filter.hpp>
 #include <duckdb/planner/expression/bound_comparison_expression.hpp>
@@ -37,6 +39,24 @@ UnsupportedExpression(const char *reason, const duckdb::Expression &expr) {
 }
 
 std::optional<duckdb::string> ExpressionToString(const duckdb::Expression &expr, const duckdb::string &column_name);
+
+/*
+ * Values interpolated into the Postgres table-scan query must not carry
+ * IvorySQL type aliases (e.g. "ivory:oradate"): Value::ToSQLString() renders
+ * the alias as the cast target ('...'::ivory:oradate), which the Postgres
+ * parser rejects with a syntax error. The alias only tags the DuckDB logical
+ * type, so casting to the alias-free base type does not change the value.
+ */
+duckdb::Value
+AliasFreeValue(const duckdb::Value &value) {
+	const auto &alias = value.type().GetAlias();
+	if (alias.rfind("ivory:", 0) != 0) {
+		return value;
+	}
+	auto base_type = value.type();
+	base_type.SetAlias("");
+	return value.DefaultCastAs(base_type);
+}
 
 duckdb::string
 FilterJoin(duckdb::vector<duckdb::string> &filters, duckdb::string &&delimiter) {
@@ -276,10 +296,26 @@ int
 PostgresScanGlobalState::ExtractQueryFilters(duckdb::TableFilter *filter, const char *column_name,
                                              duckdb::string &query_filters, bool is_inside_optional_filter) {
 	switch (filter->filter_type) {
-	case duckdb::TableFilterType::CONSTANT_COMPARISON:
-	case duckdb::TableFilterType::IS_NULL:
-	case duckdb::TableFilterType::IS_NOT_NULL:
+	case duckdb::TableFilterType::CONSTANT_COMPARISON: {
+		auto &constant_filter = filter->Cast<duckdb::ConstantFilter>();
+		query_filters += column_name + duckdb::ExpressionTypeToOperator(constant_filter.comparison_type) +
+		                 AliasFreeValue(constant_filter.constant).ToSQLString();
+		return 1;
+	}
 	case duckdb::TableFilterType::IN_FILTER: {
+		auto &in_filter = filter->Cast<duckdb::InFilter>();
+		duckdb::string in_list;
+		for (auto &val : in_filter.values) {
+			if (!in_list.empty()) {
+				in_list += ", ";
+			}
+			in_list += AliasFreeValue(val).ToSQLString();
+		}
+		query_filters += column_name + (" IN (" + in_list + ")");
+		return 1;
+	}
+	case duckdb::TableFilterType::IS_NULL:
+	case duckdb::TableFilterType::IS_NOT_NULL: {
 		query_filters += filter->ToString(column_name).c_str();
 		return 1;
 	}

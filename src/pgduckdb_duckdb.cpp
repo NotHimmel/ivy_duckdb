@@ -17,6 +17,7 @@
 #include "pgduckdb/pgduckdb_metadata_cache.hpp"
 #include "pgduckdb/pgduckdb_extensions.hpp"
 #include "pgduckdb/pgduckdb_secrets_helper.hpp"
+#include "pgduckdb/pgduckdb_types.hpp"
 #include "pgduckdb/pgduckdb_unsupported_type_optimizer.hpp"
 #include "pgduckdb/pgduckdb_userdata_cache.hpp"
 #include "pgduckdb/pgduckdb_utils.hpp"
@@ -186,6 +187,7 @@ DuckDBManager::Initialize() {
 
 	auto &dbconfig = duckdb::DBConfig::GetConfig(*database->instance);
 	dbconfig.storage_extensions["pgduckdb"] = duckdb::make_uniq<PostgresStorageExtension>();
+	RegisterIvoryAliasCasts(dbconfig);
 
 	// Register the unsupported type optimizer to run after all other optimizations
 	dbconfig.optimizer_extensions.push_back(UnsupportedTypeOptimizer::GetOptimizerExtension());
