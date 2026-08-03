@@ -32,6 +32,7 @@ extern "C" {
 #include "utils/builtins.h"
 #include "utils/date.h"
 #include "utils/jsonb.h"
+#include "utils/fmgrprotos.h"
 #include "utils/lsyscache.h"
 #include "utils/numeric.h"
 #include "utils/syscache.h"
@@ -390,6 +391,12 @@ ConvertDoubleDatum(const duckdb::Value &value) {
 	return Float8GetDatum(value.GetValue<double>());
 }
 
+/* Wrapper so PostgresFunctionGuard can call the fmgr conversion. */
+static Datum
+Float8DatumToNumeric(Datum d) {
+	return DirectFunctionCall1(float8_numeric, d);
+}
+
 template <class T, class OP = DecimalConversionInteger>
 void
 ConvertNumeric(const duckdb::Value &ddb_value, idx_t scale, NumericVar &result) {
@@ -471,9 +478,14 @@ ConvertNumericDatum(const duckdb::Value &value) {
 		return pg_numeric;
 	}
 
-	// Special handle duckdb DOUBLE TYPE.
+	// Special handle duckdb DOUBLE TYPE (unbounded NUMERIC/NUMBER columns are
+	// scanned as DOUBLE). The target column here is numeric (or IvorySQL
+	// sys.number, same varlena representation), so a real numeric datum must
+	// be produced: returning the raw by-value float8 Datum makes Postgres
+	// dereference the float bits as a varlena pointer and segfault the
+	// backend (hit by projecting a typmod-less NUMBER column through DuckDB).
 	if (value_type_id == duckdb::LogicalTypeId::DOUBLE) {
-		return ConvertDoubleDatum(value);
+		return PostgresFunctionGuard(Float8DatumToNumeric, ConvertDoubleDatum(value));
 	}
 
 	NumericVar numeric_var;
